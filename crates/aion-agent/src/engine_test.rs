@@ -4,6 +4,49 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
+// Historical image pruning
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prune_historical_images_keeps_only_current_turn_and_dedupes() {
+    use aion_types::message::{ContentBlock, ImageUrl, Message, Role};
+
+    fn image(url: &str) -> ContentBlock {
+        ContentBlock::Image {
+            image_url: ImageUrl { url: url.to_owned() },
+        }
+    }
+    fn text(value: &str) -> ContentBlock {
+        ContentBlock::Text { text: value.to_owned() }
+    }
+
+    let mut messages = vec![
+        Message::new(Role::User, vec![text("first"), image("data:image/png;base64,AAA")]),
+        Message::new(Role::Assistant, vec![text("description")]),
+        Message::new(Role::User, vec![text("new turn")]),
+        Message::new(Role::User, vec![image("data:image/png;base64,BBB")]),
+        Message::new(Role::User, vec![image("data:image/png;base64,BBB")]),
+        Message::new(Role::User, vec![image("data:image/png;base64,CCC")]),
+    ];
+
+    super::prune_historical_images(&mut messages);
+
+    let images: Vec<&str> = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Image { image_url } => Some(image_url.url.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, vec!["data:image/png;base64,BBB", "data:image/png;base64,CCC"]);
+    assert!(
+        messages.iter().all(|message| !message.content.is_empty()),
+        "pruning an image-only message must leave a non-empty placeholder"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // set_config tests — apply_config_update()
 // ---------------------------------------------------------------------------
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem::replace;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -658,7 +659,14 @@ impl AgentEngine {
         // Record prompt state for cache diagnostics
         self.cache_detector.record_request(&system, &tools);
 
+        // Images from older turns must not be re-sent on every request: they
+        // consume context/rate budget and can make a provider reject the whole
+        // conversation once the accumulated image tokens exceed its quota.
+        // Keep only images attached in the current turn and deduplicate
+        // repeated views of the same image. This prunes the provider-bound
+        // copy only; the stored session history stays untouched.
         let mut messages = self.messages.clone();
+        prune_historical_images(&mut messages);
         if let Some(prompt) = kind.control_prompt() {
             messages.push(Message::now(
                 Role::User,
@@ -1229,6 +1237,64 @@ impl AgentEngine {
         }
 
         Ok(())
+    }
+}
+
+/// Drop image blocks from older turns and deduplicate repeated images in the
+/// current turn.
+///
+/// The current turn starts at the latest user message carrying text (the
+/// prompt, including AionUI's `[Attached files]` marker). Tool results and
+/// `ViewImage` follow-ups are user messages without text, so images attached
+/// by the current turn's tool calls survive. Once a new text turn begins, the
+/// previous turn's images are removed from the provider-bound request while
+/// the stored session history remains untouched; the model keeps the earlier
+/// textual description and can call `ViewImage` again if it needs to
+/// re-inspect the file.
+fn prune_historical_images(messages: &mut [Message]) {
+    const OMITTED_IMAGE_PREFIX: &str = "[image omitted from context";
+    let is_prompt_text = |text: &str| !text.starts_with(OMITTED_IMAGE_PREFIX);
+
+    let turn_start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if is_prompt_text(text)))
+        })
+        .unwrap_or(0);
+
+    let mut seen_images = HashSet::new();
+    let mut pruned_images = 0usize;
+    for (index, message) in messages.iter_mut().enumerate() {
+        let mut removed_image = false;
+        message.content.retain(|block| {
+            let ContentBlock::Image { image_url } = block else {
+                return true;
+            };
+            let keep = index >= turn_start && seen_images.insert(image_url.url.clone());
+            if !keep {
+                removed_image = true;
+                pruned_images += 1;
+            }
+            keep
+        });
+        // Tool follow-ups can consist of a single image. Removing it must not
+        // leave an empty message (providers reject empty content), and the
+        // placeholder must be ignored by the turn-boundary detector above.
+        if removed_image && message.content.is_empty() {
+            message.content.push(ContentBlock::Text {
+                text: format!("{OMITTED_IMAGE_PREFIX}]"),
+            });
+        }
+    }
+    if pruned_images > 0 {
+        debug!(
+            target: "aion_agent",
+            pruned_images, "pruned historical images from provider context"
+        );
     }
 }
 
